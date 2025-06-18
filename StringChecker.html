@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <title>4 バイト文字・絵文字チェッカー</title>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 2rem; }
+    textarea { width: 100%; max-width: 600px; height: 6rem; }
+    #warningList { margin-top: 1rem; color: #d00; }
+  </style>
+</head>
+<body>
+  <h1>入力文字チェック</h1>
+  <p>4 バイト文字・絵文字・サロゲートペアが含まれると下に警告が出ます。</p>
+
+  <textarea id="input" placeholder="ここに入力してください"></textarea>
+  <ul id="warningList"></ul>
+
+  <script>
+    const input  = document.getElementById('input');
+    const list   = document.getElementById('warningList');
+
+    // --- ① 4 バイト (サロゲートペア) 検出 --------------------------
+    const surrogatePairRE = /[\uD800-\uDBFF][\uDC00-\uDFFF]/g;
+
+    // --- ② 絵文字検出 : Extended_Pictographic プロパティを利用 ------
+    //    （モダンブラウザなら OK。古い環境では try–catch で無効化）
+    let emojiRE;
+    try {
+      emojiRE = /\p{Extended_Pictographic}/gu;
+    } catch {
+      emojiRE = null;          // Unicode property escape 非対応
+    }
+
+    // --- ③ 入力イベントで検査 --------------------------------------
+    input.addEventListener('input', () => {
+      const text = input.value;
+      const found = new Set();           // 重複排除用
+
+      // サロゲートペア (4 バイト) を収集
+      for (const m of text.matchAll(surrogatePairRE)) {
+        found.add(m[0]);
+      }
+
+      // 絵文字を収集
+      if (emojiRE) {
+        for (const m of text.matchAll(emojiRE)) {
+          found.add(m[0]);
+        }
+      }
+
+      // --- ④ 警告リストを描画 --------------------------------------
+      list.innerHTML = '';               // リセット
+      for (const ch of found) {
+        const li = document.createElement('li');
+        li.textContent = `"${ch}" が存在しています`;
+        list.appendChild(li);
+      }
+    });
+  </script>
+</body>
+</html>
