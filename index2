@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>フォント非対応文字チェッカー – Debug v5</title>
+<style>
+  body{font-family:system-ui,sans-serif;margin:2rem;line-height:1.6}
+  textarea{width:100%;max-width:640px;height:6rem}
+  #warningList{margin-top:1rem;color:#d00}
+  #status{margin:.5rem 0 1rem;font-size:.9rem;color:#06c}
+</style>
+<!-- opentype.js は optional（高速化用） -->
+<script src="https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.min.js"></script>
+</head>
+<body>
+<h1>フォント非対応文字チェッカー – Debug v5</h1>
+
+<p>① フォントを選択 → ② テキストを入力<br>
+描けなかった文字・絵文字だけ赤で警告します。Console で詳細ログも確認できます。</p>
+
+<input type="file" id="fontFile" accept=".ttf,.otf,.woff,.woff2">
+<div id="status">フォント未読み込み</div>
+
+<textarea id="input" placeholder="ここに入力してください" disabled></textarea>
+<ul id="warningList"></ul>
+
+<script>
+/* ====== デバッグ ====== */
+const DEBUG = false;
+const log   = (...a)=>{ if(DEBUG) console.log(...a); };
+
+/* ====== DOM refs ====== */
+const input  = document.getElementById('input');
+const list   = document.getElementById('warningList');
+const status = document.getElementById('status');
+
+/* ====== 状態 ====== */
+let fontName = '';
+let supportedSet = null;
+
+/* ====== Grapheme セグメンター ====== */
+const graphemeSegments = (str)=>{
+  if ('Segmenter' in Intl){
+    const seg = new Intl.Segmenter('und', { granularity:'grapheme' });
+    return [...seg.segment(str)].map(s=>s.segment);
+  }
+  return [...str];          // fallback: code-unit
+};
+
+/* ====== Canvas 幅比較 ====== */
+const canvas = document.createElement('canvas');
+const ctx    = canvas.getContext('2d');
+const measure = (font, text)=>{
+  ctx.font = `40px ${font}`;
+  return ctx.measureText(text).width;
+};
+function inFontByWidth(text){
+  const wFont  = measure(`"${fontName}"`, text);
+  const wSerif = measure('serif',        text);
+  const wSans  = measure('sans-serif',   text);
+  const ok     = (wFont !== wSerif) || (wFont !== wSans);
+  log('[width]', text, 'wFont=',wFont,'serif=',wSerif,'sans=',wSans,'→',ok);
+  return ok;
+}
+
+/* ====== opentype.js からコードポイント集合 ====== */
+function buildSupportedSet(font){
+  const set = new Set();
+  if (font.tables?.cmap?.glyphIndexMap){
+    for (const cpStr of Object.keys(font.tables.cmap.glyphIndexMap)){
+      set.add(Number(cpStr));
+    }
+  }
+  if (font.glyphs && typeof font.glyphs.length === 'number'){
+    for (let i=0;i<font.glyphs.length;i++){
+      const g = font.glyphs.get(i);
+      g.unicodes?.forEach(u=>set.add(u));
+      if (typeof g.unicode==='number') set.add(g.unicode);
+    }
+  }
+  return set;
+}
+
+/* ====== ファイル選択 ====== */
+document.getElementById('fontFile').addEventListener('change', async ev=>{
+  const file = ev.target.files?.[0];
+  if(!file) return;
+  log('=== selected:', file.name, file.size,'bytes ===');
+
+  const buf = await file.arrayBuffer();
+
+  /* FontFace */
+  fontName = `UploadedFont_${Date.now()}`;
+  const face = await new FontFace(fontName, buf).load();
+  document.fonts.add(face);
+  await document.fonts.load(`16px "${fontName}"`);
+  input.style.fontFamily = `"${fontName}", sans-serif`;
+  input.disabled = false;
+
+  /* ★ ここで「読み込み成功」の表示を出す ★ */
+  status.textContent = `「${file.name}」を読み込みました（opentype 解析中…）`;
+  status.style.color = '#06c';
+
+  log('[FontFace] loaded', fontName);
+
+  /* opentype.js 解析 */
+  supportedSet = null;
+  try{
+    const font = opentype.parse(buf);
+    supportedSet = buildSupportedSet(font);
+    log('[opentype] cpSet size=', supportedSet.size);
+  }catch(e){
+    console.warn('[opentype] parse failed → width fallback', e);
+  }
+
+  list.innerHTML='';
+  input.value='';
+});
+
+/* ====== 判定関数 ====== */
+function hasGlyph(text){
+  if (supportedSet && text.length===1){
+    const cp = text.codePointAt(0);
+    const ok = supportedSet.has(cp);
+    log('[Set]', text, 'U+'+cp.toString(16), '→', ok);
+    if (ok) return true;   // glyph 有
+  }
+  return inFontByWidth(text); // フォールバック
+}
+
+/* ====== 入力監視 ====== */
+input.addEventListener('input', ()=>{
+  if(!fontName) return;
+
+  const clusters = graphemeSegments(input.value);
+  const unsupported = new Set();
+
+  log('--- INPUT', clusters.join(''),'---');
+  for(const cl of clusters){
+    if(!hasGlyph(cl)) unsupported.add(cl);
+  }
+  log('[unsupported]', [...unsupported].join(' '));
+
+  list.innerHTML='';
+  for(const ch of unsupported){
+    const li = document.createElement('li');
+    li.textContent = `"${ch}" はアップロードしたフォントに含まれていません`;
+    list.appendChild(li);
+  }
+});
+</script>
+</body>
+</html>
