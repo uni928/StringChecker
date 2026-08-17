@@ -1,0 +1,326 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>フォント収録文字チェッカー</title>
+<style>
+/* base: レイヤー順を固定し、未レイヤーCSSを作らない */
+@layer reset, base, components, states;
+
+@layer reset {
+  /* reset: 最低限のボックスモデル調整 */
+  *, *::before, *::after { box-sizing: border-box; }
+}
+
+@layer base {
+  /* base: 画面全体と基本タイポグラフィ */
+  body {
+    margin: 2rem;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.7;
+    color: #222;
+    background: #fff;
+  }
+
+  h1 { margin-bottom: .5rem; }
+  p { max-width: 760px; }
+
+  textarea {
+    width: 100%;
+    max-width: 760px;
+    min-height: 8rem;
+    padding: .75rem;
+    font: inherit;
+    resize: vertical;
+  }
+
+  button,
+  input,
+  textarea { font: inherit; }
+}
+
+@layer components {
+  /* components: 説明・状態表示・判定結果の見た目 */
+  .note {
+    max-width: 760px;
+    padding: .75rem 1rem;
+    border: 1px solid #ccc;
+    border-radius: .5rem;
+    background: #fafafa;
+  }
+
+  #status {
+    margin: .75rem 0 1rem;
+    font-size: .95rem;
+  }
+
+  #resultSummary {
+    margin-top: 1rem;
+    font-weight: 600;
+  }
+
+  #warningList {
+    margin-top: .5rem;
+    padding-left: 1.5rem;
+  }
+
+  #warningList li { margin: .25rem 0; }
+}
+
+@layer states {
+  /* states: 成功・警告・エラーの状態色 */
+  .status-info { color: #06c; }
+  .status-ok { color: #087a2f; }
+  .status-error { color: #b00020; }
+  .unsupported { color: #b00020; }
+  .uncertain { color: #8a5a00; }
+}
+</style>
+<!-- opentype.js: TTF / OTF / WOFF の cmap 解析に使用 -->
+<script src="https://cdn.jsdelivr.net/npm/opentype.js@1.3.4/dist/opentype.min.js"></script>
+</head>
+<body>
+<h1>フォント収録文字チェッカー</h1>
+
+<p>① フォントを選択 → ② テキストを入力</p>
+<p class="note">
+  このツールは、アップロードしたフォントの <code>cmap</code> にUnicodeコードポイントが登録されているかを確認します。
+  単独文字は「収録あり / なし」を判定できますが、ZWJ絵文字・異体字セレクタ・結合文字などの複合シーケンスは、
+  GSUB / GPOS / variation sequence / カラーグリフ等の影響があるため「要確認」と表示します。
+</p>
+
+<input type="file" id="fontFile" accept=".ttf,.otf,.woff">
+<div id="status" class="status-info">フォント未読み込み</div>
+
+<textarea id="input" placeholder="ここに入力してください" disabled></textarea>
+<div id="resultSummary" aria-live="polite"></div>
+<ul id="warningList" aria-live="polite"></ul>
+
+<script>
+/* ====== デバッグ ====== */
+const DEBUG = false;
+const log = (...args) => { if (DEBUG) console.log(...args); };
+
+/* ====== DOM refs ====== */
+const fontFileInput = document.getElementById('fontFile');
+const input = document.getElementById('input');
+const list = document.getElementById('warningList');
+const status = document.getElementById('status');
+const resultSummary = document.getElementById('resultSummary');
+
+/* ====== 状態 ====== */
+let fontName = '';
+let supportedSet = null;
+
+/* ====== Grapheme セグメンター ====== */
+const graphemeSegments = (str) => {
+  if ('Segmenter' in Intl) {
+    const seg = new Intl.Segmenter('und', { granularity: 'grapheme' });
+    return [...seg.segment(str)].map(part => part.segment);
+  }
+
+  // fallback: Unicodeコードポイント単位。結合文字やZWJシーケンスは分割される。
+  return [...str];
+};
+
+/* ====== Unicode helpers ====== */
+const codePointsOf = (text) => [...text].map(ch => ch.codePointAt(0));
+
+const formatCodePoint = (cp) => `U+${cp.toString(16).toUpperCase().padStart(4, '0')}`;
+
+const isIgnorableWhitespace = (text) => /^[\r\n\t ]+$/.test(text);
+
+const hasComplexSequenceMarker = (codePoints) => {
+  return codePoints.some(cp =>
+    cp === 0x200D ||                    // ZWJ
+    cp === 0xFE0E || cp === 0xFE0F ||  // variation selector-15/16
+    (cp >= 0xE0100 && cp <= 0xE01EF) ||// variation selectors supplement
+    (cp >= 0x1F3FB && cp <= 0x1F3FF)   // emoji skin tone modifiers
+  );
+};
+
+const containsCombiningMark = (text) => {
+  try {
+    return /\p{Mark}/u.test(text);
+  } catch {
+    // Unicode property escapes 非対応環境向けの主な結合文字範囲
+    return /[\u0300-\u036F\u1AB0-\u1AFF\u1DC0-\u1DFF\u20D0-\u20FF\uFE20-\uFE2F]/.test(text);
+  }
+};
+
+/* ====== opentype.js からコードポイント集合 ====== */
+function buildSupportedSet(font) {
+  const set = new Set();
+
+  if (font.tables?.cmap?.glyphIndexMap) {
+    for (const cpStr of Object.keys(font.tables.cmap.glyphIndexMap)) {
+      const cp = Number(cpStr);
+      if (Number.isFinite(cp)) set.add(cp);
+    }
+  }
+
+  if (font.glyphs && typeof font.glyphs.length === 'number') {
+    for (let i = 0; i < font.glyphs.length; i++) {
+      const glyph = font.glyphs.get(i);
+      glyph.unicodes?.forEach(cp => set.add(cp));
+      if (typeof glyph.unicode === 'number') set.add(glyph.unicode);
+    }
+  }
+
+  return set;
+}
+
+/* ====== 判定 ====== */
+function inspectCluster(text) {
+  if (!supportedSet) {
+    return {
+      type: 'error',
+      text,
+      message: 'フォント解析情報がないため判定できません'
+    };
+  }
+
+  if (isIgnorableWhitespace(text)) {
+    return { type: 'supported', text };
+  }
+
+  const codePoints = codePointsOf(text);
+  const missing = codePoints.filter(cp => !supportedSet.has(cp));
+
+  if (missing.length > 0) {
+    return {
+      type: 'unsupported',
+      text,
+      codePoints,
+      missing,
+      message: `未収録: ${missing.map(formatCodePoint).join(', ')}`
+    };
+  }
+
+  // 単一コードポイントなら cmap 収録をそのまま判定結果として扱える。
+  if (codePoints.length === 1) {
+    return {
+      type: 'supported',
+      text,
+      codePoints
+    };
+  }
+
+  // 複数コードポイントは、全コードポイントがcmapにあっても最終描画を保証できない。
+  const complex = hasComplexSequenceMarker(codePoints) || containsCombiningMark(text);
+  return {
+    type: 'uncertain',
+    text,
+    codePoints,
+    message: complex
+      ? '構成コードポイントは収録されていますが、複合シーケンスとして正しく描画できるかは要確認です'
+      : '複数コードポイントで構成されるため、実際の合字・位置調整結果は要確認です'
+  };
+}
+
+/* ====== ファイル選択 ====== */
+fontFileInput.addEventListener('change', async event => {
+  const file = event.target.files?.[0];
+  if (!file) return;
+
+  input.disabled = true;
+  input.value = '';
+  list.innerHTML = '';
+  resultSummary.textContent = '';
+  supportedSet = null;
+  fontName = '';
+
+  const lowerName = file.name.toLowerCase();
+  if (lowerName.endsWith('.woff2')) {
+    setStatus('WOFF2はこの版では解析対象外です。TTF / OTF / WOFFを選択してください。', 'error');
+    return;
+  }
+
+  try {
+    setStatus(`「${file.name}」を読み込み中…`, 'info');
+
+    const buf = await file.arrayBuffer();
+
+    // ブラウザ上のプレビュー表示用。判定自体にはCanvas幅比較を使わない。
+    fontName = `UploadedFont_${Date.now()}`;
+    const face = await new FontFace(fontName, buf).load();
+    document.fonts.add(face);
+    await document.fonts.load(`16px "${fontName}"`);
+    input.style.fontFamily = `"${fontName}", sans-serif`;
+
+    if (!window.opentype?.parse) {
+      throw new Error('opentype.js を読み込めませんでした。');
+    }
+
+    const font = opentype.parse(buf);
+    supportedSet = buildSupportedSet(font);
+
+    if (supportedSet.size === 0) {
+      throw new Error('cmap からUnicode対応情報を取得できませんでした。');
+    }
+
+    input.disabled = false;
+    setStatus(`「${file.name}」を読み込みました。Unicode収録数: ${supportedSet.size.toLocaleString()} コードポイント`, 'ok');
+    log('[opentype] cpSet size=', supportedSet.size);
+  } catch (error) {
+    console.error(error);
+    supportedSet = null;
+    fontName = '';
+    input.disabled = true;
+    setStatus(`フォントを解析できませんでした: ${error.message}`, 'error');
+  }
+});
+
+function setStatus(message, kind) {
+  status.textContent = message;
+  status.className = `status-${kind}`;
+}
+
+/* ====== 入力監視 ====== */
+input.addEventListener('input', () => {
+  if (!supportedSet) return;
+
+  const clusters = graphemeSegments(input.value);
+  const results = clusters.map(inspectCluster);
+
+  const unsupportedMap = new Map();
+  const uncertainMap = new Map();
+
+  for (const result of results) {
+    if (result.type === 'unsupported' && !unsupportedMap.has(result.text)) {
+      unsupportedMap.set(result.text, result);
+    }
+    if (result.type === 'uncertain' && !uncertainMap.has(result.text)) {
+      uncertainMap.set(result.text, result);
+    }
+  }
+
+  list.innerHTML = '';
+
+  for (const result of unsupportedMap.values()) {
+    const li = document.createElement('li');
+    li.className = 'unsupported';
+    li.textContent = `「${result.text}」はアップロードしたフォントに必要なコードポイントがありません（${result.message}）`;
+    list.appendChild(li);
+  }
+
+  for (const result of uncertainMap.values()) {
+    const li = document.createElement('li');
+    li.className = 'uncertain';
+    li.textContent = `「${result.text}」: ${result.message}`;
+    list.appendChild(li);
+  }
+
+  const unsupportedCount = unsupportedMap.size;
+  const uncertainCount = uncertainMap.size;
+
+  if (unsupportedCount === 0 && uncertainCount === 0) {
+    resultSummary.textContent = input.value ? 'cmap上で未収録の文字は見つかりませんでした。' : '';
+  } else {
+    resultSummary.textContent = `未収録 ${unsupportedCount} 種類 / 要確認 ${uncertainCount} 種類`;
+  }
+});
+</script>
+</body>
+</html>
